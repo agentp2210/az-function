@@ -1,0 +1,20 @@
+# TypeScript output
+dist
+out
+
+# Azure Functions artifacts
+bin
+obj
+appsettings.json
+local.settings.json
+
+appsettings.json
+local.settings.json
+
+node_modules
+.npmrc
+.env
+
+out
+coverage
+junit.xml

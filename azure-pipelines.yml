@@ -1,0 +1,186 @@
+trigger:
+  - develop
+
+# Global variables for all stages
+variables:
+  vmImageNamePool: "ubuntu-latest"
+  serviceConnectionSB: "<name of Azure DevOps service connection for Sandbox, e.g. rg-iot-platform-sb-401>"
+  serviceConnectionAccp: "r<name of Azure DevOps service connection for Sandbox, e.g. g-iot-platform-a-101>"
+  serviceConnectionProd: "<name of Azure DevOps service connection for Sandbox, e.g. rg-iot-platform-p-001>"
+  isAcceptanceBranch: $[eq(variables['Build.SourceBranch'], 'refs/heads/develop')]
+  isMainBranch: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+stages:
+  - stage: build
+    displayName: Build
+    jobs:
+      - job: Build
+        displayName: Build artifacts
+        pool:
+          vmImage: $(vmImageNamePool)
+
+        steps:
+          - task: SonarCloudPrepare@1
+            inputs:
+              SonarCloud: 'SonarCloud'
+              organization: 'eneco'
+              scannerMode: 'CLI'
+              configMode: 'file'
+              configFile: './sonar-project.properties'
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "18.x"
+            displayName: "Install Node.js"
+
+          - task: Npm@1
+            displayName: "Install dependencies"
+            inputs:
+              command: "install"
+              customRegistry: "useFeed"
+              customFeed: "1e6da757-ceb2-4d07-92ca-0e6d52856bfd"
+
+          - script: |
+              npm test
+            displayName: "Run linter and tests"
+            env:
+              WEBSITE_SITE_NAME: "azuredevops-pipeline"
+              <same list of environment settings as in the local .env file>
+
+          - task: reportgenerator@4
+            displayName: Generate code coverage report
+            inputs:
+              reports: "coverage/clover.xml"
+              targetdir: "$(Agent.TempDirectory)/coveragereports"
+
+          - task: PublishTestResults@2
+            displayName: Publish testresults
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "**/junit*.xml"
+
+          - task: PublishCodeCoverageResults@1
+            displayName: Publish code coverage results
+            inputs:
+              codeCoverageTool: "Cobertura"
+              summaryFileLocation: "$(Agent.TempDirectory)/coveragereports/Cobertura.xml"
+
+          - task: SonarCloudAnalyze@1
+
+          - task: SonarCloudPublish@1
+            inputs:
+              pollingTimeoutSec: '300'
+
+          - task: Npm@1
+            displayName: "Prune Node modules for production only"
+            inputs:
+              command: "custom"
+              customCommand: "prune --production"
+              customRegistry: "useFeed"
+              customFeed: "1e6da757-ceb2-4d07-92ca-0e6d52856bfd"
+
+          - task: CmdLine@2
+            displayName: 'Clean working directory before archiving'
+            inputs:
+              script: |
+                rm -rf $(System.DefaultWorkingDirectory)/coverage
+                rm -rf $(System.DefaultWorkingDirectory)/test
+                rm -rf $(System.DefaultWorkingDirectory)/.git
+                rm -rf $(System.DefaultWorkingDirectory)/.vscode
+                rm -rf $(System.DefaultWorkingDirectory)/*.sh
+                rm -rf $(System.DefaultWorkingDirectory)/*.xml
+                rm -rf $(System.DefaultWorkingDirectory)/.eslint*
+
+          - task: ArchiveFiles@2
+            displayName: "Archive files"
+            inputs:
+              rootFolderOrFile: "$(System.DefaultWorkingDirectory)"
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+
+          - upload: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+            artifact: <name function>
+
+  # Sandbox environment
+  - stage: deploy_sb
+    displayName: Deploy to Sandbox
+    dependsOn:
+      - build
+    condition: succeeded()
+    jobs:
+      - deployment: deploy
+        displayName: Deploy Function App
+        environment: Sandbox
+        pool:
+          vmImage: $(vmImageNamePool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureFunctionApp@1
+                  displayName: "Azure Functions App Deploy: <name function>-func-sb"
+                  inputs:
+                    azureSubscription: $(serviceConnectionSB)
+                    appType: functionApp
+                    appName: "<name function>-func-sb"
+                    package: "$(Pipeline.Workspace)/<name function>/*.zip"
+                    appSettings: >-
+                      -<list of environment settings which will be partly keyvault references, each on a new line prefixed with a dash>
+
+  # Acceptance environment
+  - stage: deploy_acc
+    displayName: Deploy to Acceptance
+    dependsOn:
+      - build
+      - deploy_sb
+    # Only allow deployment from develop or main branch
+    condition: and(succeeded(), or(eq(variables.isAcceptanceBranch, true), eq(variables.isMainBranch, true)))
+    jobs:
+      - deployment: deploy
+        displayName: Deploy Function App
+        environment: Acceptance
+        pool:
+          vmImage: $(vmImageNamePool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureFunctionApp@1
+                  displayName: "Azure Functions App Deploy: <name function>-func-a"
+                  inputs:
+                    azureSubscription: $(serviceConnectionAccp)
+                    appType: functionApp
+                    appName: "<name function>-func-a"
+                    package: "$(Pipeline.Workspace)/esp-data-publisher/$(Build.BuildId).zip"
+                    appSettings: >-
+                      -<list of environment settings which will be partly keyvault references, each on a new line prefixed with a dash>
+
+  # Production environment
+  - stage: deploy_prod
+    displayName: Deploy to Production
+    dependsOn:
+      - build
+      - deploy_acc
+    # Only allow deployment from main branch
+    condition: and(succeeded(), eq(variables.isMainBranch, true))
+    jobs:
+      - deployment: deploy
+        displayName: Deploy Function App
+        environment: Production
+        pool:
+          vmImage: $(vmImageNamePool)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureFunctionApp@1
+                  displayName: "Azure Functions App Deploy: <name function>-func-p"
+                  inputs:
+                    azureSubscription: $(serviceConnectionProd)
+                    appType: functionApp
+                    appName: "<name function>-func-p"
+                    package: "$(Pipeline.Workspace)/esp-data-publisher/$(Build.BuildId).zip"
+                    appSettings: >-
+                      -<list of environment settings which will be partly keyvault references, each on a new line prefixed with a dash>
